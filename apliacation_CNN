@@ -1,0 +1,725 @@
+#!/usr/bin/env python3
+# coding: utf-8
+
+# ============================================================
+# Aplicacion de la CNN pulse-only a poblaciones ANAIS
+# ============================================================
+#
+# Este script carga el ultimo modelo entrenado por trainCNN_multiple_scint0_detw.py
+# y lo aplica a:
+#   - neutron single
+#   - neutron multiple
+#   - neutron total
+#   - calibration
+#   - coincidence
+#   - TestTree
+#
+# Salidas principales:
+#   - predicciones por evento
+#   - eficiencia CNN por energia y ycut
+#   - mean score por energia
+#   - ritmo corregido de TestTree
+#   - comparacion global con BDT
+
+from pathlib import Path
+from datetime import datetime
+import gc
+import json
+import os
+
+import numpy as np
+import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import uproot
+import awkward as ak
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+import tensorflow as tf
+
+
+# ============================================================
+# Configuracion general
+# ============================================================
+
+DATA_DIR = Path("dataTrees")
+TRAIN_RESULTS_DIR = Path("resultados_CNN_multiple_scint0_detw")
+OUT_DIR = Path("resultados_CNN_multiple_scint0_detw_app")
+
+PRED_DIR = OUT_DIR / "predictions"
+FIG_DIR = OUT_DIR / "figures"
+TABLE_DIR = OUT_DIR / "tables"
+CONFIG_DIR = OUT_DIR / "config"
+BDT_DIR = OUT_DIR / "bdt_comparison"
+
+for folder in [PRED_DIR, FIG_DIR, TABLE_DIR, CONFIG_DIR, BDT_DIR]:
+    folder.mkdir(parents=True, exist_ok=True)
+
+RUN_TAG = datetime.now().strftime("app_multiple_scint0_detw_%Y%m%d_%H%M%S")
+
+TREE_NAME = "T"
+DETECTORS = list(range(9))
+MODEL_PATH = None
+
+NUM_PMTS = 2
+TOTAL_POINTS = 2520
+VSCALE = 0.125
+SRATE = 2
+TYPICAL_T0_NS = 250
+TYPICAL_T0_PTS = int(TYPICAL_T0_NS * SRATE)
+
+PRE_NS = 50
+DOWNSAMPLING_FACTOR = 4
+NORM_METHOD = "max"
+CHUNK_SIZE = 5000
+
+DELTA_E = 0.1
+E_FULL_MIN = 1.0
+E_FULL_MAX = 10.0
+E_ZOOM_MIN = 1.0
+E_ZOOM_MAX = 2.0
+E_RATE_ZOOM_MIN = 1.0
+E_RATE_ZOOM_MAX = 2.5
+
+YCUT_VALUES = [0.75, 0.8, 0.85, 0.9, 0.95]
+
+MASS_DET_KG = 12.5
+LIVE_TIME_DAYS = 100.902
+
+BDT_RATE_FILE = DATA_DIR / "bkgHisto_sig2_noi2_set0_70p_BDT200_rb0_E110.root"
+BDT_EFF_FILE = DATA_DIR / "effHistoBDT_sig2_noi2_set0_70p_BDT200_pob2.root"
+
+
+# ============================================================
+# Poblaciones de aplicacion
+# ============================================================
+
+APPLY_SOURCES = [
+    {
+        "name": "neutron_single_1_2",
+        "pattern": "neutronTree_single_run9000_run9012_D{det}_E1.002.00.root",
+        "energy_range": (1.0, 2.0),
+        "cuts": [],
+        "source_id": 101,
+    },
+    {
+        "name": "neutron_multiple_1_2",
+        "pattern": "neutronTree_multiple_run9000_run9012_D{det}_E1.002.00.root",
+        "energy_range": (1.0, 2.0),
+        "cuts": [],
+        "source_id": 102,
+    },
+    {
+        "name": "neutron_total_1_10",
+        "pattern": "neutronTree_run9000_run9012_D{det}_E1.0010.00.root",
+        "energy_range": (1.0, 10.0),
+        "cuts": [],
+        "source_id": 201,
+    },
+    {
+        "name": "calibration_1_10",
+        "pattern": "calibrationTree_3years_D{det}_E1.0010.00.root",
+        "energy_range": (1.0, 10.0),
+        "cuts": [],
+        "source_id": 202,
+    },
+    {
+        "name": "coincidence_0_6",
+        "pattern": "coincidenceTree_3years_D{det}_E0.006.00.root",
+        "energy_range": (1.0, 6.0),
+        "cuts": [],
+        "source_id": 203,
+    },
+    {
+        "name": "testtree_1_10",
+        "pattern": "TestTree_3years_D{det}_E1.0010.00.root",
+        "energy_range": (1.0, 10.0),
+        "cuts": [("P1", ">", 0.35), ("vts", ">", 1.0)],
+        "source_id": 301,
+    },
+]
+
+SIGNAL_POPULATIONS = [
+    "neutron_single_1_2",
+    "neutron_multiple_1_2",
+    "neutron_total_1_10",
+    "calibration_1_10",
+    "coincidence_0_6",
+]
+
+CONFIG = {
+    "run_tag": RUN_TAG,
+    "train_results_dir": str(TRAIN_RESULTS_DIR),
+    "out_dir": str(OUT_DIR),
+    "detectors": DETECTORS,
+    "apply_sources": APPLY_SOURCES,
+    "ycut_values": YCUT_VALUES,
+    "delta_e": DELTA_E,
+    "mass_det_kg": MASS_DET_KG,
+    "live_time_days": LIVE_TIME_DAYS,
+}
+
+with open(CONFIG_DIR / f"config_{RUN_TAG}.json", "w", encoding="utf-8") as f:
+    json.dump(CONFIG, f, indent=2)
+
+print("RUN_TAG:", RUN_TAG, flush=True)
+print("OUT_DIR:", OUT_DIR, flush=True)
+
+
+# ============================================================
+# Preprocesado de pulsos
+# ============================================================
+
+def branch_exists(tree, branch):
+    # Comprueba si existe una rama.
+    return branch in tree.keys()
+
+
+def source_path(source, detector):
+    # Construye la ruta ROOT para un detector.
+    return DATA_DIR / source["pattern"].format(det=detector)
+
+
+def downsample_waveform(w, factor=DOWNSAMPLING_FACTOR):
+    # Promedia bloques de longitud factor.
+    w = np.asarray(w, dtype=np.float32)
+    if factor <= 1:
+        return w
+    n = (len(w) // factor) * factor
+    return w[:n].reshape(-1, factor).mean(axis=1).astype(np.float32)
+
+
+def window_until_end(signal, t0_pts, pre_samples, rms):
+    # Extrae una ventana desde t0-pre_samples hasta el final esperado.
+    n_final = pre_samples + (TOTAL_POINTS - TYPICAL_T0_PTS)
+    start = int(t0_pts) - pre_samples
+
+    pad_left = max(0, -start)
+    idx_start = max(0, start)
+    part_len = n_final - pad_left
+    idx_end = min(len(signal), idx_start + part_len)
+
+    part = signal[idx_start:idx_end]
+    pad_right = max(0, n_final - (pad_left + len(part)))
+
+    rms_safe = float(rms) if np.isfinite(rms) else 0.0
+    left = np.random.normal(0, rms_safe, pad_left).astype(np.float32) if pad_left else np.empty(0, dtype=np.float32)
+    right = np.random.normal(0, rms_safe, pad_right).astype(np.float32) if pad_right else np.empty(0, dtype=np.float32)
+
+    window = np.concatenate([left, part.astype(np.float32), right]).astype(np.float32)
+    if len(window) > n_final:
+        window = window[:n_final]
+    elif len(window) < n_final:
+        window = np.pad(window, (0, n_final - len(window))).astype(np.float32)
+    return window.astype(np.float32)
+
+
+def normalize_pulses_max(w0, w1, pre_samples):
+    # Normaliza los dos PMTs por el maximo absoluto comun tras el pretrigger.
+    max0 = np.max(np.abs(w0[pre_samples:])) if len(w0[pre_samples:]) else 0.0
+    max1 = np.max(np.abs(w1[pre_samples:])) if len(w1[pre_samples:]) else 0.0
+    scale = max(max0, max1)
+    if not np.isfinite(scale) or scale <= 0:
+        scale = 1.0
+    return w0 / scale, w1 / scale
+
+
+def select_entries(root_path, source):
+    # Selecciona eventos por energia y cortes de metadata.
+    with uproot.open(root_path) as f:
+        tree = f[TREE_NAME]
+        n_total = tree.num_entries
+
+        branches = ["BE"]
+        for branch, _, _ in source.get("cuts", []):
+            if branch not in branches:
+                branches.append(branch)
+
+        missing = [b for b in branches if not branch_exists(tree, b)]
+        if missing:
+            raise KeyError(f"Faltan ramas en {root_path}: {missing}")
+
+        arrays = tree.arrays(branches, library="np", entry_start=0, entry_stop=n_total)
+        emin, emax = source["energy_range"]
+        mask = (arrays["BE"] >= emin) & (arrays["BE"] <= emax)
+
+        for branch, op, value in source.get("cuts", []):
+            if op == ">":
+                mask &= arrays[branch] > value
+            elif op == ">=":
+                mask &= arrays[branch] >= value
+            elif op == "<":
+                mask &= arrays[branch] < value
+            elif op == "<=":
+                mask &= arrays[branch] <= value
+            else:
+                raise ValueError(f"Operador no reconocido: {op}")
+
+    return np.flatnonzero(mask).astype(np.int64)
+
+
+def read_events(root_path, detector, source, selected_entries):
+    # Lee y preprocesa los eventos seleccionados.
+    selected_entries = np.asarray(selected_entries, dtype=np.int64)
+    pre_samples = int(PRE_NS * SRATE)
+    n_time = (pre_samples + (TOTAL_POINTS - TYPICAL_T0_PTS)) // DOWNSAMPLING_FACTOR
+
+    if selected_entries.size == 0:
+        return np.empty((0, n_time, NUM_PMTS), dtype=np.float32), pd.DataFrame()
+
+    x_list = []
+    meta_rows = []
+
+    with uproot.open(root_path) as f:
+        tree = f[TREE_NAME]
+        p0_name = f"p{detector}0"
+        p1_name = f"p{detector}1"
+
+        required = [p0_name, p1_name, "t00", "t01", "dc0", "dc1", "rms0", "rms1"]
+        missing = [b for b in required if not branch_exists(tree, b)]
+        if missing:
+            raise KeyError(f"Faltan ramas en {root_path}: {missing}")
+
+        meta_branches = [b for b in ["BE", "P1", "FM", "vts"] if branch_exists(tree, b)]
+        branches = required + meta_branches
+
+        first = int(selected_entries[0])
+        last = int(selected_entries[-1]) + 1
+
+        for start in range(first, last, CHUNK_SIZE):
+            stop = min(start + CHUNK_SIZE, last)
+            mask = (selected_entries >= start) & (selected_entries < stop)
+            if not np.any(mask):
+                continue
+
+            local_entries = selected_entries[mask] - start
+            arrays = tree.arrays(branches, library="ak", entry_start=start, entry_stop=stop)
+
+            pulses0 = arrays[p0_name]
+            pulses1 = arrays[p1_name]
+            t00 = ak.to_numpy(arrays["t00"])
+            t01 = ak.to_numpy(arrays["t01"])
+            dc0 = ak.to_numpy(arrays["dc0"])
+            dc1 = ak.to_numpy(arrays["dc1"])
+            rms0 = ak.to_numpy(arrays["rms0"])
+            rms1 = ak.to_numpy(arrays["rms1"])
+
+            def meta_array(branch):
+                return ak.to_numpy(arrays[branch]) if branch in meta_branches else np.full(len(t00), np.nan)
+
+            be = meta_array("BE")
+            p1_var = meta_array("P1")
+            fm = meta_array("FM")
+            vts = meta_array("vts")
+
+            for loc in local_entries:
+                loc = int(loc)
+                global_entry = start + loc
+
+                if not np.isfinite(t00[loc]) or not np.isfinite(t01[loc]):
+                    continue
+
+                p0_raw = ak.to_numpy(pulses0[loc]).astype(np.float32)
+                p1_raw = ak.to_numpy(pulses1[loc]).astype(np.float32)
+
+                if len(p0_raw) == 0 or len(p1_raw) == 0:
+                    continue
+
+                # Correccion de baseline y cambio de signo para que el pulso sea positivo.
+                p0 = -(p0_raw - dc0[loc] / VSCALE)
+                p1 = -(p1_raw - dc1[loc] / VSCALE)
+
+                t00_pts = int(t00[loc] * SRATE)
+                t01_pts = int(t01[loc] * SRATE)
+                t0_pts = min(t00_pts, t01_pts)
+
+                w0 = window_until_end(p0, t0_pts, pre_samples, rms0[loc] / VSCALE)
+                w1 = window_until_end(p1, t0_pts, pre_samples, rms1[loc] / VSCALE)
+
+                if NORM_METHOD == "max":
+                    w0, w1 = normalize_pulses_max(w0, w1, pre_samples)
+                else:
+                    raise ValueError("NORM_METHOD no reconocido")
+
+                w0 = downsample_waveform(w0)
+                w1 = downsample_waveform(w1)
+
+                x_list.append(np.stack([w0, w1], axis=1).astype(np.float32))
+                meta_rows.append({
+                    "entry": int(global_entry),
+                    "detector": int(detector),
+                    "BE": float(be[loc]),
+                    "P1": float(p1_var[loc]),
+                    "FM": float(fm[loc]),
+                    "vts": float(vts[loc]),
+                    "t00": float(t00[loc]),
+                    "t01": float(t01[loc]),
+                    "source_id": int(source["source_id"]),
+                    "source_file": root_path.name,
+                    "population": source["name"],
+                })
+
+    x = np.stack(x_list, axis=0).astype(np.float32) if x_list else np.empty((0, n_time, NUM_PMTS), dtype=np.float32)
+    return x, pd.DataFrame(meta_rows)
+
+
+# ============================================================
+# Carga del modelo
+# ============================================================
+
+if MODEL_PATH is None:
+    candidates = sorted((TRAIN_RESULTS_DIR / "models").glob("*.keras"), key=lambda p: p.stat().st_mtime)
+    if not candidates:
+        raise FileNotFoundError(f"No hay modelos .keras en {TRAIN_RESULTS_DIR / 'models'}")
+    MODEL_PATH = candidates[-1]
+
+model = tf.keras.models.load_model(MODEL_PATH)
+print("Modelo cargado:", MODEL_PATH, flush=True)
+model.summary()
+
+
+# ============================================================
+# Prediccion por poblacion
+# ============================================================
+
+all_predictions = []
+summary_rows = []
+
+for source in APPLY_SOURCES:
+    source_predictions = []
+
+    for det in DETECTORS:
+        root_path = source_path(source, det)
+        if not root_path.exists():
+            print(f"AVISO: no existe {root_path}", flush=True)
+            summary_rows.append({"population": source["name"], "detector": det, "exists": False, "n_selected": 0, "n_predicted": 0})
+            continue
+
+        entries = select_entries(root_path, source)
+        x, meta = read_events(root_path, det, source, entries)
+
+        if len(meta) == 0:
+            summary_rows.append({"population": source["name"], "detector": det, "exists": True, "n_selected": len(entries), "n_predicted": 0})
+            continue
+
+        score = model.predict(x, batch_size=512, verbose=0).flatten()
+        meta["score"] = score
+        meta["prediction_cut_0p5"] = (score >= 0.5).astype(int)
+
+        source_predictions.append(meta)
+        summary_rows.append({"population": source["name"], "detector": det, "exists": True, "n_selected": len(entries), "n_predicted": len(meta)})
+
+        print(f"{source['name']} D{det}: seleccionados={len(entries)} predichos={len(meta)}", flush=True)
+
+        del x
+        gc.collect()
+
+    if source_predictions:
+        df_source = pd.concat(source_predictions, ignore_index=True)
+        df_source.to_csv(PRED_DIR / f"predicciones_{source['name']}_{RUN_TAG}.tsv", sep="\t", index=False)
+        all_predictions.append(df_source)
+
+summary_df = pd.DataFrame(summary_rows)
+summary_df.to_csv(TABLE_DIR / f"resumen_aplicacion_{RUN_TAG}.tsv", sep="\t", index=False)
+
+if not all_predictions:
+    raise RuntimeError("No se ha generado ninguna prediccion")
+
+pred = pd.concat(all_predictions, ignore_index=True)
+pred.to_csv(PRED_DIR / f"predicciones_todas_{RUN_TAG}.tsv", sep="\t", index=False)
+
+
+# ============================================================
+# Tablas de eficiencia, mean score y ritmo corregido
+# ============================================================
+
+def make_edges(e_min, e_max, delta):
+    return np.round(np.arange(e_min, e_max + delta / 2, delta), 6)
+
+
+def binomial_error(n_pass, n_total):
+    if n_total <= 0:
+        return np.nan
+    eff = n_pass / n_total
+    return np.sqrt(eff * (1.0 - eff) / n_total)
+
+
+def compute_efficiency(pred_df, edges, ycuts, group_cols):
+    rows = []
+    signals = pred_df[pred_df["population"].isin(SIGNAL_POPULATIONS)].copy()
+
+    for keys, group in signals.groupby(group_cols):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        key_dict = dict(zip(group_cols, keys))
+
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            g_bin = group[(group["BE"] >= lo) & (group["BE"] < hi)]
+            n_total = len(g_bin)
+
+            for ycut in ycuts:
+                n_pass = int(np.sum(g_bin["score"].to_numpy() >= ycut))
+                eff = n_pass / n_total if n_total else np.nan
+                row = {
+                    **key_dict,
+                    "E_min": lo,
+                    "E_max": hi,
+                    "E_center": 0.5 * (lo + hi),
+                    "ycut": ycut,
+                    "n_total": n_total,
+                    "n_pass": n_pass,
+                    "efficiency": eff,
+                    "efficiency_err": binomial_error(n_pass, n_total),
+                }
+                rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def compute_mean_score(pred_df, edges, group_cols):
+    rows = []
+    signals = pred_df[pred_df["population"].isin(SIGNAL_POPULATIONS)].copy()
+
+    for keys, group in signals.groupby(group_cols):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        key_dict = dict(zip(group_cols, keys))
+
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            g_bin = group[(group["BE"] >= lo) & (group["BE"] < hi)]
+            scores = g_bin["score"].to_numpy()
+            rows.append({
+                **key_dict,
+                "E_min": lo,
+                "E_max": hi,
+                "E_center": 0.5 * (lo + hi),
+                "n": len(scores),
+                "mean_score": float(np.mean(scores)) if len(scores) else np.nan,
+                "std_score": float(np.std(scores)) if len(scores) else np.nan,
+            })
+
+    return pd.DataFrame(rows)
+
+
+def compute_corrected_rate(pred_df, eff_global, eff_det, edges, ycuts):
+    rows_global = []
+    rows_det = []
+    test = pred_df[pred_df["population"] == "testtree_1_10"].copy()
+
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        bin_width = hi - lo
+        test_bin = test[(test["BE"] >= lo) & (test["BE"] < hi)]
+
+        for ycut in ycuts:
+            # Global: suma eventos de todos los detectores y usa masa total.
+            n_pass = int(np.sum(test_bin["score"].to_numpy() >= ycut))
+            eff_row = eff_global[
+                (eff_global["population"] == "neutron_total_1_10")
+                & (eff_global["E_min"] == lo)
+                & (eff_global["ycut"] == ycut)
+            ]
+            eff = float(eff_row["efficiency"].iloc[0]) if len(eff_row) else np.nan
+            eff_err = float(eff_row["efficiency_err"].iloc[0]) if len(eff_row) else np.nan
+
+            exposure = MASS_DET_KG * len(DETECTORS) * LIVE_TIME_DAYS * bin_width
+            rate = n_pass / (exposure * eff) if eff and eff > 0 else np.nan
+            stat_err = np.sqrt(n_pass) / (exposure * eff) if n_pass > 0 and eff and eff > 0 else np.nan
+            eff_part = rate * eff_err / eff if eff and eff > 0 and np.isfinite(eff_err) else np.nan
+            total_err = np.sqrt(stat_err**2 + eff_part**2) if np.isfinite(stat_err) and np.isfinite(eff_part) else stat_err
+
+            rows_global.append({
+                "E_min": lo,
+                "E_max": hi,
+                "E_center": 0.5 * (lo + hi),
+                "ycut": ycut,
+                "n_pass": n_pass,
+                "efficiency": eff,
+                "rate_ckkd": rate,
+                "rate_err": total_err,
+            })
+
+            # Por detector: mismo calculo con la masa de un detector.
+            for det in DETECTORS:
+                test_det = test_bin[test_bin["detector"] == det]
+                n_det = int(np.sum(test_det["score"].to_numpy() >= ycut))
+                eff_det_row = eff_det[
+                    (eff_det["population"] == "neutron_total_1_10")
+                    & (eff_det["detector"] == det)
+                    & (eff_det["E_min"] == lo)
+                    & (eff_det["ycut"] == ycut)
+                ]
+                eff_d = float(eff_det_row["efficiency"].iloc[0]) if len(eff_det_row) else np.nan
+                exposure_d = MASS_DET_KG * LIVE_TIME_DAYS * bin_width
+                rate_d = n_det / (exposure_d * eff_d) if eff_d and eff_d > 0 else np.nan
+
+                rows_det.append({
+                    "detector": det,
+                    "E_min": lo,
+                    "E_max": hi,
+                    "E_center": 0.5 * (lo + hi),
+                    "ycut": ycut,
+                    "n_pass": n_det,
+                    "efficiency": eff_d,
+                    "rate_ckkd": rate_d,
+                })
+
+    return pd.DataFrame(rows_global), pd.DataFrame(rows_det)
+
+
+edges_full = make_edges(E_FULL_MIN, E_FULL_MAX, DELTA_E)
+
+eff_global = compute_efficiency(pred, edges_full, YCUT_VALUES, ["population"])
+eff_det = compute_efficiency(pred, edges_full, YCUT_VALUES, ["population", "detector"])
+mean_score_global = compute_mean_score(pred, edges_full, ["population"])
+mean_score_det = compute_mean_score(pred, edges_full, ["population", "detector"])
+rate_global, rate_det = compute_corrected_rate(pred, eff_global, eff_det, edges_full, YCUT_VALUES)
+
+eff_global.to_csv(TABLE_DIR / f"eficiencias_senales_global_{RUN_TAG}.tsv", sep="\t", index=False)
+eff_det.to_csv(TABLE_DIR / f"eficiencias_senales_por_detector_{RUN_TAG}.tsv", sep="\t", index=False)
+mean_score_global.to_csv(TABLE_DIR / f"mean_score_senales_global_{RUN_TAG}.tsv", sep="\t", index=False)
+mean_score_det.to_csv(TABLE_DIR / f"mean_score_senales_por_detector_{RUN_TAG}.tsv", sep="\t", index=False)
+rate_global.to_csv(TABLE_DIR / f"ritmo_corregido_testtree_global_{RUN_TAG}.tsv", sep="\t", index=False)
+rate_det.to_csv(TABLE_DIR / f"ritmo_corregido_testtree_por_detector_{RUN_TAG}.tsv", sep="\t", index=False)
+
+
+# ============================================================
+# Lectura de histogramas BDT
+# ============================================================
+
+def read_hist(root_file, hist_name):
+    with uproot.open(root_file) as f:
+        values, edges = f[hist_name].to_numpy()
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    return pd.DataFrame({"E_center": centers, "value": values})
+
+
+def load_bdt_global():
+    eff_parts = []
+    rate_parts = []
+
+    for det in DETECTORS:
+        eff = read_hist(BDT_EFF_FILE, f"hbdt{det}")
+        eff["detector"] = det
+        eff_parts.append(eff)
+
+        rate = read_hist(BDT_RATE_FILE, f"hneu{det}")
+        rate["detector"] = det
+        rate_parts.append(rate)
+
+    eff_det_bdt = pd.concat(eff_parts, ignore_index=True)
+    rate_det_bdt = pd.concat(rate_parts, ignore_index=True)
+
+    eff_global_bdt = eff_det_bdt.groupby("E_center", as_index=False)["value"].mean().rename(columns={"value": "bdt_efficiency"})
+    rate_global_bdt = rate_det_bdt.groupby("E_center", as_index=False)["value"].mean().rename(columns={"value": "bdt_rate"})
+
+    eff_det_bdt.to_csv(TABLE_DIR / f"bdt_eficiencia_por_detector_{RUN_TAG}.tsv", sep="\t", index=False)
+    rate_det_bdt.to_csv(TABLE_DIR / f"bdt_ritmo_por_detector_{RUN_TAG}.tsv", sep="\t", index=False)
+    eff_global_bdt.to_csv(TABLE_DIR / f"bdt_eficiencia_global_media_detectores_{RUN_TAG}.tsv", sep="\t", index=False)
+    rate_global_bdt.to_csv(TABLE_DIR / f"bdt_ritmo_global_media_detectores_{RUN_TAG}.tsv", sep="\t", index=False)
+
+    return eff_global_bdt, rate_global_bdt
+
+
+try:
+    bdt_eff_global, bdt_rate_global = load_bdt_global()
+except Exception as exc:
+    print(f"AVISO: no se pudieron leer histogramas BDT: {exc}", flush=True)
+    bdt_eff_global = pd.DataFrame()
+    bdt_rate_global = pd.DataFrame()
+
+
+# ============================================================
+# Figuras globales
+# ============================================================
+
+def restrict_range(df, e_min, e_max):
+    return df[(df["E_center"] >= e_min) & (df["E_center"] <= e_max)].copy()
+
+
+def plot_efficiency_global(ycut, e_min, e_max, filename):
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    for pop in SIGNAL_POPULATIONS:
+        g = eff_global[(eff_global["population"] == pop) & (eff_global["ycut"] == ycut)]
+        g = restrict_range(g, e_min, e_max)
+        if len(g):
+            ax.errorbar(g["E_center"], g["efficiency"], yerr=g["efficiency_err"], marker="o", linestyle="-", label=pop)
+
+    if len(bdt_eff_global):
+        bdt = restrict_range(bdt_eff_global, e_min, e_max)
+        ax.plot(bdt["E_center"], bdt["bdt_efficiency"], color="black", linewidth=2, label="BDT")
+
+    ax.set_xlabel("Energia (keV)")
+    ax.set_ylabel("Eficiencia")
+    ax.set_ylim(-0.02, 1.05)
+    ax.set_title(f"Eficiencia global, ycut={ycut}")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(filename, dpi=200)
+    plt.close(fig)
+
+
+def plot_mean_score(e_min, e_max, filename):
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    for pop in SIGNAL_POPULATIONS:
+        g = mean_score_global[mean_score_global["population"] == pop]
+        g = restrict_range(g, e_min, e_max)
+        if len(g):
+            ax.plot(g["E_center"], g["mean_score"], marker="o", linestyle="-", label=pop)
+
+    ax.set_xlabel("Energia (keV)")
+    ax.set_ylabel("Mean score")
+    ax.set_ylim(-0.02, 1.05)
+    ax.set_title("Mean score global")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(filename, dpi=200)
+    plt.close(fig)
+
+
+def plot_rate_global(e_min, e_max, filename):
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    for ycut in YCUT_VALUES:
+        g = rate_global[rate_global["ycut"] == ycut]
+        g = restrict_range(g, e_min, e_max)
+        if len(g):
+            ax.errorbar(g["E_center"], g["rate_ckkd"], yerr=g["rate_err"], marker="o", linestyle="-", label=f"CNN ycut={ycut}")
+
+    if len(bdt_rate_global):
+        bdt = restrict_range(bdt_rate_global, e_min, e_max)
+        ax.plot(bdt["E_center"], bdt["bdt_rate"], color="black", linewidth=2, label="BDT")
+
+    ax.set_xlabel("Energia (keV)")
+    ax.set_ylabel("Ritmo corregido (cpd/kg/keV)")
+    ax.set_title("Ritmo corregido TestTree")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(filename, dpi=200)
+    plt.close(fig)
+
+
+for ycut in YCUT_VALUES:
+    ytag = str(ycut).replace(".", "p")
+    plot_efficiency_global(ycut, 1.0, 10.0, BDT_DIR / f"eficiencia_global_CNN_BDT_ycut{ytag}_1a10_{RUN_TAG}.png")
+    plot_efficiency_global(ycut, 1.0, 2.0, BDT_DIR / f"eficiencia_zoom_global_CNN_BDT_ycut{ytag}_1a2_{RUN_TAG}.png")
+
+plot_mean_score(1.0, 10.0, BDT_DIR / f"mean_score_global_1a10_{RUN_TAG}.png")
+plot_mean_score(1.0, 2.0, BDT_DIR / f"mean_score_zoom_global_1a2_{RUN_TAG}.png")
+
+plot_rate_global(1.0, 10.0, BDT_DIR / f"ritmo_testtree_CNN_BDT_global_todos_ycuts_1a10_{RUN_TAG}.png")
+plot_rate_global(1.0, 2.5, BDT_DIR / f"ritmo_testtree_CNN_BDT_global_todos_ycuts_1a2p5_{RUN_TAG}.png")
+
+print("Aplicacion terminada.", flush=True)
+print("Predicciones:", PRED_DIR, flush=True)
+print("Tablas:", TABLE_DIR, flush=True)
+print("Figuras:", BDT_DIR, flush=True)
