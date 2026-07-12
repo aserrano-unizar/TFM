@@ -1,0 +1,742 @@
+#!/usr/bin/env python3
+# coding: utf-8
+
+# ============================================================
+# Entrenamiento CNN pulse-only para ANAIS-112
+# =============================================================
+#
+# Objetivo:
+#   entrenar una CNN 1D que separe pulsos de neutron multiple
+#   frente a NotInTestTree_scint.
+#
+# Poblaciones:
+#   y = 1 -> neutron multiple, 1-2 keV
+#   y = 0 -> NotInTestTree_scint, 1-2 keV
+#
+# Puntos importantes:
+#   - TestTree no se usa para entrenar.
+#   - El detector no entra como input de la red.
+#   - La energia no entra como input de la red.
+#   - Se usan pesos para que cada detector pese igual dentro de cada clase.
+#   - Se toman todos los neutron multiple disponibles y el mismo numero de
+#     eventos negativos por detector.
+
+from pathlib import Path
+from datetime import datetime
+import json
+import os
+import warnings
+
+import numpy as np
+import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import uproot
+import awkward as ak
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_curve, auc, accuracy_score, confusion_matrix
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+import tensorflow as tf
+from tensorflow.keras import layers, models, optimizers
+from tensorflow.keras.callbacks import EarlyStopping, CSVLogger, ModelCheckpoint, TerminateOnNaN
+
+warnings.filterwarnings("default")
+
+
+# ============================================================
+# Configuracion general
+# ============================================================
+
+DATA_DIR = Path("dataTrees")
+OUT_DIR = Path("resultados_CNN_multiple_scint0_detw")
+
+CACHE_DIR = OUT_DIR / "cache"
+MODEL_DIR = OUT_DIR / "models"
+METRICS_DIR = OUT_DIR / "metrics"
+PRED_DIR = OUT_DIR / "predictions"
+FIG_DIR = OUT_DIR / "figures"
+LOG_DIR = OUT_DIR / "logs"
+CONFIG_DIR = OUT_DIR / "config"
+
+for folder in [CACHE_DIR, MODEL_DIR, METRICS_DIR, PRED_DIR, FIG_DIR, LOG_DIR, CONFIG_DIR]:
+    folder.mkdir(parents=True, exist_ok=True)
+
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+tf.random.set_seed(RANDOM_STATE)
+
+RUN_TAG = datetime.now().strftime("cnn_multiple_scint0_detw_%Y%m%d_%H%M%S")
+
+TREE_NAME = "T"
+DETECTORS = list(range(9))
+
+
+# ============================================================
+# Poblaciones de entrenamiento
+# ============================================================
+
+POSITIVE_SOURCE = {
+    "name": "neutron_multiple",
+    "label": 1,
+    "pattern": "neutronTree_multiple_run9000_run9012_D{det}_E1.002.00.root",
+    "source_id": 2,
+}
+
+NEGATIVE_SOURCE = {
+    "name": "notintest_scint",
+    "label": 0,
+    "pattern": "NotInTestTree_scint_3years_D{det}_E1.002.00.root",
+    "source_id": 0,
+}
+
+TRAIN_ENERGY_RANGE = (1.0, 2.0)
+
+
+# ============================================================
+# Parametros de los pulsos
+# ============================================================
+
+NUM_PMTS = 2
+TOTAL_POINTS = 2520
+VSCALE = 0.125
+SRATE = 2
+TYPICAL_T0_NS = 250
+TYPICAL_T0_PTS = int(TYPICAL_T0_NS * SRATE)
+
+PRE_NS = 50
+DOWNSAMPLING_FACTOR = 4
+NORM_METHOD = "max"
+
+
+# ============================================================
+# Lectura, balanceo y entrenamiento
+# ============================================================
+
+CHUNK_SIZE = 5000
+REQUIRE_FULL_LENGTH_PULSES = True
+MIN_VALID_NEGATIVE_EVENTS_PER_DETECTOR = 100
+
+NEGATIVE_PER_POSITIVE_RATIO = 1.0
+
+TRAIN_FRAC = 0.70
+VAL_FRAC = 0.20
+TEST_FRAC = 0.10
+
+BATCH_SIZE = 256
+EPOCHS = 80
+PATIENCE = 8
+
+FILTERS = 32
+KERNEL_SIZE = 3
+DENSE_UNITS = 64
+DROPOUT = 0.30
+LEARNING_RATE = 1e-3
+
+SCORE_CUT = 0.5
+
+META_COLUMNS = [
+    "entry",
+    "detector",
+    "BE",
+    "P1",
+    "FM",
+    "vts",
+    "t00",
+    "t01",
+    "label",
+    "source_id",
+]
+
+
+CONFIG = {
+    "run_tag": RUN_TAG,
+    "data_dir": str(DATA_DIR),
+    "out_dir": str(OUT_DIR),
+    "detectors": DETECTORS,
+    "positive_source": POSITIVE_SOURCE,
+    "negative_source": NEGATIVE_SOURCE,
+    "train_energy_range": TRAIN_ENERGY_RANGE,
+    "pre_ns": PRE_NS,
+    "downsampling_factor": DOWNSAMPLING_FACTOR,
+    "norm_method": NORM_METHOD,
+    "negative_per_positive_ratio": NEGATIVE_PER_POSITIVE_RATIO,
+    "require_full_length_pulses": REQUIRE_FULL_LENGTH_PULSES,
+    "train_frac": TRAIN_FRAC,
+    "val_frac": VAL_FRAC,
+    "test_frac": TEST_FRAC,
+    "batch_size": BATCH_SIZE,
+    "epochs": EPOCHS,
+    "patience": PATIENCE,
+    "filters": FILTERS,
+    "kernel_size": KERNEL_SIZE,
+    "dense_units": DENSE_UNITS,
+    "dropout": DROPOUT,
+    "learning_rate": LEARNING_RATE,
+}
+
+with open(CONFIG_DIR / f"config_{RUN_TAG}.json", "w", encoding="utf-8") as f:
+    json.dump(CONFIG, f, indent=2)
+
+print("RUN_TAG:", RUN_TAG, flush=True)
+print("Entrenamiento: pulse_only", flush=True)
+print("Rango energia:", TRAIN_ENERGY_RANGE, flush=True)
+print("Detectores:", DETECTORS, flush=True)
+
+
+# ============================================================
+# Funciones de lectura y preprocesado
+# ============================================================
+
+def source_path(source, detector):
+    # Construye la ruta ROOT para un detector.
+    return DATA_DIR / source["pattern"].format(det=detector)
+
+
+def branch_exists(tree, branch):
+    # Comprueba si existe una rama en el TTree.
+    return branch in tree.keys()
+
+
+def downsample_waveform(w, factor=DOWNSAMPLING_FACTOR):
+    # Promedia bloques de longitud factor.
+    w = np.asarray(w, dtype=np.float32)
+    if factor <= 1:
+        return w
+    n = (len(w) // factor) * factor
+    return w[:n].reshape(-1, factor).mean(axis=1).astype(np.float32)
+
+
+def window_until_end(signal, t0_pts, pre_samples, rms):
+    # Extrae una ventana desde t0-pre_samples hasta el final esperado.
+    n_final = pre_samples + (TOTAL_POINTS - TYPICAL_T0_PTS)
+    start = int(t0_pts) - pre_samples
+
+    pad_left = max(0, -start)
+    idx_start = max(0, start)
+    part_len = n_final - pad_left
+    idx_end = min(len(signal), idx_start + part_len)
+
+    part = signal[idx_start:idx_end]
+    pad_right = max(0, n_final - (pad_left + len(part)))
+
+    rms_safe = float(rms) if np.isfinite(rms) else 0.0
+    left = np.random.normal(0, rms_safe, pad_left).astype(np.float32) if pad_left else np.empty(0, dtype=np.float32)
+    right = np.random.normal(0, rms_safe, pad_right).astype(np.float32) if pad_right else np.empty(0, dtype=np.float32)
+
+    window = np.concatenate([left, part.astype(np.float32), right]).astype(np.float32)
+    if len(window) > n_final:
+        window = window[:n_final]
+    elif len(window) < n_final:
+        window = np.pad(window, (0, n_final - len(window))).astype(np.float32)
+    return window.astype(np.float32)
+
+
+def normalize_pulses_max(w0, w1, pre_samples):
+    # Normaliza ambos PMTs por el maximo absoluto comun tras el pretrigger.
+    max0 = np.max(np.abs(w0[pre_samples:])) if len(w0[pre_samples:]) else 0.0
+    max1 = np.max(np.abs(w1[pre_samples:])) if len(w1[pre_samples:]) else 0.0
+    scale = max(max0, max1)
+    if not np.isfinite(scale) or scale <= 0:
+        scale = 1.0
+    return w0 / scale, w1 / scale
+
+
+def select_entries(root_path, detector, energy_range, max_events=None, random_state=RANDOM_STATE):
+    # Selecciona entradas por energia y, si se pide, por longitud de pulso.
+    root_path = Path(root_path)
+    if not root_path.exists():
+        raise FileNotFoundError(f"No existe el archivo: {root_path}")
+
+    with uproot.open(root_path) as f:
+        tree = f[TREE_NAME]
+        n_total = tree.num_entries
+
+        if not branch_exists(tree, "BE"):
+            raise KeyError(f"No existe BE en {root_path}")
+
+        be = tree["BE"].array(library="np", entry_start=0, entry_stop=n_total)
+        emin, emax = energy_range
+        mask = (be >= emin) & (be <= emax)
+        entries = np.flatnonzero(mask).astype(np.int64)
+
+    if REQUIRE_FULL_LENGTH_PULSES:
+        entries = filter_entries_by_pulse_length(root_path, detector, entries)
+
+    if max_events is not None and len(entries) > int(max_events):
+        rng = np.random.default_rng(random_state)
+        entries = rng.choice(entries, size=int(max_events), replace=False)
+
+    return np.sort(entries.astype(np.int64))
+
+
+def filter_entries_by_pulse_length(root_path, detector, entries, expected_len=TOTAL_POINTS):
+    # Evita entrenar con pulsos vacios o truncados.
+    entries = np.asarray(entries, dtype=np.int64)
+    if entries.size == 0:
+        return entries
+
+    p0_name = f"p{detector}0"
+    p1_name = f"p{detector}1"
+    valid_parts = []
+
+    with uproot.open(root_path) as f:
+        tree = f[TREE_NAME]
+        first = int(entries[0])
+        last = int(entries[-1]) + 1
+
+        for start in range(first, last, CHUNK_SIZE):
+            stop = min(start + CHUNK_SIZE, last)
+            mask = (entries >= start) & (entries < stop)
+            if not np.any(mask):
+                continue
+
+            local = entries[mask] - start
+            arrays = tree.arrays([p0_name, p1_name], library="ak", entry_start=start, entry_stop=stop)
+            len0 = ak.to_numpy(ak.num(arrays[p0_name], axis=1))
+            len1 = ak.to_numpy(ak.num(arrays[p1_name], axis=1))
+            ok = (len0[local] == expected_len) & (len1[local] == expected_len)
+            valid_parts.append(entries[mask][ok])
+
+    if not valid_parts:
+        return np.empty(0, dtype=np.int64)
+    return np.sort(np.concatenate(valid_parts).astype(np.int64))
+
+
+def read_events(root_path, detector, label, source_id, selected_entries):
+    # Lee, alinea, normaliza y reduce los pulsos de un ROOT.
+    root_path = Path(root_path)
+    selected_entries = np.asarray(selected_entries, dtype=np.int64)
+    pre_samples = int(PRE_NS * SRATE)
+    n_time = (pre_samples + (TOTAL_POINTS - TYPICAL_T0_PTS)) // DOWNSAMPLING_FACTOR
+
+    if selected_entries.size == 0:
+        return (
+            np.empty((0, n_time, NUM_PMTS), dtype=np.float32),
+            np.empty(0, dtype=np.int8),
+            np.empty((0, len(META_COLUMNS)), dtype=np.float32),
+        )
+
+    x_list = []
+    y_list = []
+    meta_list = []
+
+    with uproot.open(root_path) as f:
+        tree = f[TREE_NAME]
+        p0_name = f"p{detector}0"
+        p1_name = f"p{detector}1"
+
+        required = [p0_name, p1_name, "t00", "t01", "dc0", "dc1", "rms0", "rms1"]
+        missing = [b for b in required if not branch_exists(tree, b)]
+        if missing:
+            raise KeyError(f"Faltan ramas en {root_path}: {missing}")
+
+        optional = [b for b in ["BE", "P1", "FM", "vts"] if branch_exists(tree, b)]
+        branches = required + optional
+
+        first = int(selected_entries[0])
+        last = int(selected_entries[-1]) + 1
+
+        for start in range(first, last, CHUNK_SIZE):
+            stop = min(start + CHUNK_SIZE, last)
+            mask = (selected_entries >= start) & (selected_entries < stop)
+            if not np.any(mask):
+                continue
+
+            local_entries = selected_entries[mask] - start
+            arrays = tree.arrays(branches, library="ak", entry_start=start, entry_stop=stop)
+
+            pulses0 = arrays[p0_name]
+            pulses1 = arrays[p1_name]
+            t00 = ak.to_numpy(arrays["t00"])
+            t01 = ak.to_numpy(arrays["t01"])
+            dc0 = ak.to_numpy(arrays["dc0"])
+            dc1 = ak.to_numpy(arrays["dc1"])
+            rms0 = ak.to_numpy(arrays["rms0"])
+            rms1 = ak.to_numpy(arrays["rms1"])
+
+            be = ak.to_numpy(arrays["BE"]) if "BE" in optional else np.full(len(t00), np.nan)
+            p1_var = ak.to_numpy(arrays["P1"]) if "P1" in optional else np.full(len(t00), np.nan)
+            fm = ak.to_numpy(arrays["FM"]) if "FM" in optional else np.full(len(t00), np.nan)
+            vts = ak.to_numpy(arrays["vts"]) if "vts" in optional else np.full(len(t00), np.nan)
+
+            for loc in local_entries:
+                loc = int(loc)
+                global_entry = start + loc
+
+                if not np.isfinite(t00[loc]) or not np.isfinite(t01[loc]):
+                    continue
+
+                p0_raw = ak.to_numpy(pulses0[loc]).astype(np.float32)
+                p1_raw = ak.to_numpy(pulses1[loc]).astype(np.float32)
+
+                if REQUIRE_FULL_LENGTH_PULSES and (len(p0_raw) != TOTAL_POINTS or len(p1_raw) != TOTAL_POINTS):
+                    continue
+
+                # Correccion de baseline y cambio de signo para que el pulso sea positivo.
+                p0 = -(p0_raw - dc0[loc] / VSCALE)
+                p1 = -(p1_raw - dc1[loc] / VSCALE)
+
+                t00_pts = int(t00[loc] * SRATE)
+                t01_pts = int(t01[loc] * SRATE)
+                t0_pts = min(t00_pts, t01_pts)
+
+                w0 = window_until_end(p0, t0_pts, pre_samples, rms0[loc] / VSCALE)
+                w1 = window_until_end(p1, t0_pts, pre_samples, rms1[loc] / VSCALE)
+
+                if NORM_METHOD == "max":
+                    w0, w1 = normalize_pulses_max(w0, w1, pre_samples)
+                else:
+                    raise ValueError("NORM_METHOD no reconocido")
+
+                w0 = downsample_waveform(w0)
+                w1 = downsample_waveform(w1)
+
+                x_list.append(np.stack([w0, w1], axis=1).astype(np.float32))
+                y_list.append(int(label))
+                meta_list.append([
+                    float(global_entry),
+                    float(detector),
+                    float(be[loc]),
+                    float(p1_var[loc]),
+                    float(fm[loc]),
+                    float(vts[loc]),
+                    float(t00[loc]),
+                    float(t01[loc]),
+                    float(label),
+                    float(source_id),
+                ])
+
+    x = np.stack(x_list, axis=0).astype(np.float32) if x_list else np.empty((0, n_time, NUM_PMTS), dtype=np.float32)
+    y = np.asarray(y_list, dtype=np.int8)
+    meta = np.asarray(meta_list, dtype=np.float32)
+    return x, y, meta
+
+
+# ============================================================
+# Construccion del dataset
+# ============================================================
+
+x_parts = []
+y_parts = []
+meta_parts = []
+positive_counts = {}
+
+for det in DETECTORS:
+    pos_path = source_path(POSITIVE_SOURCE, det)
+    pos_entries = select_entries(pos_path, det, TRAIN_ENERGY_RANGE, max_events=None)
+    x_pos, y_pos, meta_pos = read_events(
+        pos_path,
+        detector=det,
+        label=POSITIVE_SOURCE["label"],
+        source_id=POSITIVE_SOURCE["source_id"],
+        selected_entries=pos_entries,
+    )
+
+    positive_counts[det] = len(y_pos)
+    x_parts.append(x_pos)
+    y_parts.append(y_pos)
+    meta_parts.append(meta_pos)
+    print(f"{POSITIVE_SOURCE['name']} D{det}: {len(y_pos)} eventos", flush=True)
+
+print("Conteos positivos por detector:", positive_counts, flush=True)
+
+for det in DETECTORS:
+    n_neg = int(np.ceil(positive_counts[det] * NEGATIVE_PER_POSITIVE_RATIO))
+    neg_path = source_path(NEGATIVE_SOURCE, det)
+    neg_entries = select_entries(
+        neg_path,
+        det,
+        TRAIN_ENERGY_RANGE,
+        max_events=n_neg,
+        random_state=RANDOM_STATE + det,
+    )
+
+    if len(neg_entries) < MIN_VALID_NEGATIVE_EVENTS_PER_DETECTOR:
+        raise RuntimeError(
+            f"D{det}: solo hay {len(neg_entries)} negativos validos. "
+            "No es suficiente para entrenar una CNN de pulsos."
+        )
+
+    x_neg, y_neg, meta_neg = read_events(
+        neg_path,
+        detector=det,
+        label=NEGATIVE_SOURCE["label"],
+        source_id=NEGATIVE_SOURCE["source_id"],
+        selected_entries=neg_entries,
+    )
+
+    x_parts.append(x_neg)
+    y_parts.append(y_neg)
+    meta_parts.append(meta_neg)
+    print(f"{NEGATIVE_SOURCE['name']} D{det}: {len(y_neg)} eventos", flush=True)
+
+x = np.concatenate(x_parts, axis=0).astype(np.float32)
+y = np.concatenate(y_parts, axis=0).astype(np.int8)
+meta = np.concatenate(meta_parts, axis=0).astype(np.float32)
+
+finite = np.all(np.isfinite(x), axis=(1, 2)) & np.all(np.isfinite(meta), axis=1)
+if not np.all(finite):
+    print(f"Aviso: se eliminan {np.sum(~finite)} eventos no finitos", flush=True)
+    x = x[finite]
+    y = y[finite]
+    meta = meta[finite]
+
+np.savez_compressed(CACHE_DIR / f"dataset_{RUN_TAG}.npz", X=x, y=y, meta=meta)
+
+summary = pd.DataFrame(meta, columns=META_COLUMNS)
+summary["label"] = summary["label"].astype(int)
+summary["detector"] = summary["detector"].astype(int)
+summary["source_id"] = summary["source_id"].astype(int)
+
+counts = summary.groupby(["label", "detector", "source_id"]).size().reset_index(name="n")
+counts.to_csv(METRICS_DIR / f"conteos_dataset_{RUN_TAG}.tsv", sep="\t", index=False)
+
+print("Dataset construido", flush=True)
+print("X:", x.shape, "y:", y.shape, flush=True)
+print(counts, flush=True)
+
+
+# ============================================================
+# Split train/val/test y pesos por detector
+# ============================================================
+
+def compute_detector_weights(y_array, detector_array):
+    # Dentro de cada clase, fuerza que todos los detectores tengan el mismo peso total.
+    weights = np.ones_like(y_array, dtype=np.float32)
+    y_int = y_array.astype(int)
+    det_int = detector_array.astype(int)
+
+    for label in np.unique(y_int):
+        class_mask = y_int == label
+        detectors = np.unique(det_int[class_mask])
+        n_class = np.sum(class_mask)
+
+        for det in detectors:
+            mask = class_mask & (det_int == det)
+            n_det = np.sum(mask)
+            if n_det > 0:
+                weights[mask] *= n_class / (len(detectors) * n_det)
+
+    weights /= np.mean(weights)
+    return weights.astype(np.float32)
+
+
+sample_weight = compute_detector_weights(y, meta[:, 1])
+strat_key = np.array([f"y{int(yy)}_D{int(dd)}_S{int(ss)}" for yy, dd, ss in zip(y, meta[:, 1], meta[:, 9])])
+
+remaining_frac = VAL_FRAC + TEST_FRAC
+val_fraction_of_remaining = VAL_FRAC / remaining_frac
+
+x_train, x_tmp, y_train, y_tmp, meta_train, meta_tmp, w_train, w_tmp, strat_train, strat_tmp = train_test_split(
+    x,
+    y,
+    meta,
+    sample_weight,
+    strat_key,
+    train_size=TRAIN_FRAC,
+    random_state=RANDOM_STATE,
+    shuffle=True,
+    stratify=strat_key,
+)
+
+x_val, x_test, y_val, y_test, meta_val, meta_test, w_val, w_test = train_test_split(
+    x_tmp,
+    y_tmp,
+    meta_tmp,
+    w_tmp,
+    train_size=val_fraction_of_remaining,
+    random_state=RANDOM_STATE,
+    shuffle=True,
+    stratify=strat_tmp,
+)
+
+for name, meta_split in [("train", meta_train), ("val", meta_val), ("test", meta_test)]:
+    pd.DataFrame(meta_split, columns=META_COLUMNS).to_csv(PRED_DIR / f"meta_{name}_{RUN_TAG}.tsv", sep="\t", index=False)
+
+weights_summary = pd.DataFrame(meta, columns=META_COLUMNS)
+weights_summary["label"] = weights_summary["label"].astype(int)
+weights_summary["detector"] = weights_summary["detector"].astype(int)
+weights_summary["source_id"] = weights_summary["source_id"].astype(int)
+weights_summary["sample_weight"] = sample_weight
+weights_summary = (
+    weights_summary
+    .groupby(["label", "source_id", "detector"])
+    .agg(n=("sample_weight", "size"), weight_sum=("sample_weight", "sum"), weight_mean=("sample_weight", "mean"))
+    .reset_index()
+)
+weights_summary.to_csv(METRICS_DIR / f"pesos_dataset_{RUN_TAG}.tsv", sep="\t", index=False)
+
+print("Train:", x_train.shape, y_train.shape, flush=True)
+print("Val:  ", x_val.shape, y_val.shape, flush=True)
+print("Test: ", x_test.shape, y_test.shape, flush=True)
+
+
+# ============================================================
+# Modelo CNN pulse-only
+# ============================================================
+
+def build_cnn(input_shape):
+    # Arquitectura convolucional dilatada inspirada en el codigo original de Ivan.
+    pulse_input = layers.Input(shape=input_shape, name="pulse_input")
+
+    conv1 = layers.Conv1D(FILTERS, KERNEL_SIZE, dilation_rate=1, padding="same", activation="relu", name="conv_dil1")(pulse_input)
+    conv2 = layers.Conv1D(FILTERS, 2 * KERNEL_SIZE + 1, dilation_rate=2, padding="same", activation="relu", name="conv_dil2")(conv1)
+    conv3 = layers.Conv1D(2 * FILTERS, 2 * KERNEL_SIZE + 1, dilation_rate=4, padding="same", activation="relu", name="conv_dil4")(conv2)
+    conv4 = layers.Conv1D(2 * FILTERS, 2 * KERNEL_SIZE + 1, dilation_rate=8, padding="same", activation="relu", name="conv_dil8")(conv3)
+
+    gap = layers.GlobalAveragePooling1D(name="global_average_pooling")(conv4)
+    gmp = layers.GlobalMaxPooling1D(name="global_max_pooling")(conv4)
+    features = layers.Concatenate(name="pulse_features")([gap, gmp])
+
+    dense = layers.Dense(DENSE_UNITS, activation="relu", name="dense_features")(features)
+    drop = layers.Dropout(DROPOUT, name="dropout")(dense)
+    output = layers.Dense(1, activation="sigmoid", name="score")(drop)
+
+    model = models.Model(inputs=pulse_input, outputs=output, name="cnn_pulse_only")
+    model.compile(
+        optimizer=optimizers.Adam(LEARNING_RATE),
+        loss="binary_crossentropy",
+        metrics=[tf.keras.metrics.AUC(name="auc"), "accuracy"],
+    )
+    return model
+
+
+model = build_cnn(x_train.shape[1:])
+model.summary()
+
+
+# ============================================================
+# Entrenamiento
+# ============================================================
+
+model_path = MODEL_DIR / f"modelo_pulse_only_{RUN_TAG}.keras"
+history_path = LOG_DIR / f"history_pulse_only_{RUN_TAG}.csv"
+
+callbacks = [
+    TerminateOnNaN(),
+    EarlyStopping(monitor="val_auc", mode="max", patience=PATIENCE, restore_best_weights=True, verbose=1),
+    ModelCheckpoint(filepath=model_path, monitor="val_auc", mode="max", save_best_only=True, verbose=1),
+    CSVLogger(history_path),
+]
+
+history = model.fit(
+    x_train,
+    y_train,
+    sample_weight=w_train,
+    validation_data=(x_val, y_val, w_val),
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    callbacks=callbacks,
+    verbose=1,
+)
+
+model.save(model_path)
+with open(CONFIG_DIR / f"model_path_{RUN_TAG}.txt", "w", encoding="utf-8") as f:
+    f.write(str(model_path))
+
+print("Modelo guardado en:", model_path, flush=True)
+
+
+# ============================================================
+# Evaluacion y diagnosticos
+# ============================================================
+
+def evaluate_split(name, x_split, y_split, meta_split, weight_split):
+    score = model.predict(x_split, batch_size=BATCH_SIZE, verbose=0).flatten()
+    finite_score = np.isfinite(score)
+    if not np.all(finite_score):
+        raise ValueError(f"Hay scores no finitos en {name}")
+
+    pred = (score >= SCORE_CUT).astype(int)
+    fpr, tpr, _ = roc_curve(y_split, score)
+    auc_value = auc(fpr, tpr)
+    acc_value = accuracy_score(y_split, pred, sample_weight=weight_split)
+    cm = confusion_matrix(y_split, pred)
+
+    df = pd.DataFrame(meta_split, columns=META_COLUMNS)
+    df["score"] = score
+    df["prediction"] = pred
+    df["sample_weight"] = weight_split
+    df.to_csv(PRED_DIR / f"predicciones_{name}_pulse_only_{RUN_TAG}.tsv", sep="\t", index=False)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot(fpr, tpr, label=f"AUC = {auc_value:.4f}")
+    ax.plot([0, 1], [0, 1], "--", color="gray")
+    ax.set_xlabel("False positive rate")
+    ax.set_ylabel("True positive rate")
+    ax.set_title(f"ROC {name}")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(FIG_DIR / f"roc_{name}_pulse_only_{RUN_TAG}.png", dpi=200)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.hist(score[y_split == 0], bins=50, histtype="step", density=True, label="y=0")
+    ax.hist(score[y_split == 1], bins=50, histtype="step", density=True, label="y=1")
+    ax.set_xlabel("score CNN")
+    ax.set_ylabel("densidad")
+    ax.set_title(f"Distribucion de score {name}")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(FIG_DIR / f"score_hist_{name}_pulse_only_{RUN_TAG}.png", dpi=200)
+    plt.close(fig)
+
+    return {
+        "split": name,
+        "auc": auc_value,
+        "accuracy": acc_value,
+        "n": len(y_split),
+        "cm": cm,
+    }
+
+
+metrics = [
+    evaluate_split("train", x_train, y_train, meta_train, w_train),
+    evaluate_split("val", x_val, y_val, meta_val, w_val),
+    evaluate_split("test", x_test, y_test, meta_test, w_test),
+]
+
+metrics_df = pd.DataFrame([{k: v for k, v in m.items() if k != "cm"} for m in metrics])
+metrics_df.to_csv(METRICS_DIR / f"metricas_pulse_only_{RUN_TAG}.tsv", sep="\t", index=False)
+np.savetxt(METRICS_DIR / f"confusion_matrix_test_pulse_only_{RUN_TAG}.tsv", metrics[-1]["cm"], fmt="%d", delimiter="\t")
+
+history_df = pd.DataFrame(history.history)
+history_df.to_csv(METRICS_DIR / f"history_pulse_only_{RUN_TAG}.tsv", sep="\t", index=False)
+
+fig, ax = plt.subplots(figsize=(7, 5))
+ax.plot(history_df["loss"], label="train")
+ax.plot(history_df["val_loss"], label="val")
+ax.set_xlabel("epoch")
+ax.set_ylabel("loss")
+ax.set_title("Evolucion de la loss")
+ax.grid(alpha=0.3)
+ax.legend()
+fig.tight_layout()
+fig.savefig(FIG_DIR / f"history_loss_pulse_only_{RUN_TAG}.png", dpi=200)
+plt.close(fig)
+
+if "auc" in history_df and "val_auc" in history_df:
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(history_df["auc"], label="train")
+    ax.plot(history_df["val_auc"], label="val")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("AUC")
+    ax.set_title("Evolucion del AUC")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(FIG_DIR / f"history_auc_pulse_only_{RUN_TAG}.png", dpi=200)
+    plt.close(fig)
+
+print("Metricas finales:", flush=True)
+print(metrics_df, flush=True)
+print("Entrenamiento terminado.", flush=True)
